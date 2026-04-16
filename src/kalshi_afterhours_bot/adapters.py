@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Optional
+
+from pykalshi import Action, OrderStatus, Side
 
 from .models import BookLevel, BookSide, MarketPosition, RestingOrderState
 
@@ -90,123 +91,277 @@ class DryRunAdapter(ExchangeAdapter):
 
 
 class PykalshiAdapter(ExchangeAdapter):
-    """Skeleton adapter for wiring the strategy to your installed `pykalshi`.
+    """
+    Real exchange adapter backed by your installed `pykalshi`.
 
-    Important:
-    This file is intentionally conservative. The core strategy logic is fully
-    implemented elsewhere, but exchange-side method wiring should be verified
-    against the exact `pykalshi` version installed in your environment before
-    sending live orders.
+    Design goal
+    -----------
+    This class is the only place in the project that should know raw pykalshi
+    details like DataFrame column names, Kalshi order objects, and enum types.
+
+    Everything above this layer should think in strategy-native objects:
+    - MarketSnapshot
+    - MarketPosition
+    - RestingOrderState
     """
 
     def __init__(self, client) -> None:
         self.client = client
 
+    # -------------------------------------------------------------------------
+    # Internal helpers
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _price_dollars_to_int(price_dollars) -> int:
+        """
+        Convert a price expressed in dollars (e.g. 0.45) into integer cents (45).
+
+        We use integer cents internally for deterministic comparisons and to avoid
+        float slippage in the strategy logic.
+        """
+        return int(round(float(price_dollars) * 100))
+
+    @staticmethod
+    def _side_to_book_side(side_value: str) -> BookSide:
+        """
+        Normalize pykalshi/raw side strings into our internal BookSide enum.
+        """
+        side_value = str(side_value).lower()
+        if side_value == "yes":
+            return BookSide.YES
+        if side_value == "no":
+            return BookSide.NO
+        raise ValueError(f"Unknown side value: {side_value}")
+
+    def _get_order_object(self, order_id: str):
+        """
+        Fetch the rich pykalshi Order object by ID.
+
+        We use this for live amend/cancel actions because the runtime object
+        exposes methods like:
+        - amend(...)
+        - cancel()
+        - decrease(...)
+        """
+        return self.client.portfolio.get_order(order_id)
+
+    # -------------------------------------------------------------------------
+    # Read methods
+    # -------------------------------------------------------------------------
+
     def list_event_market_tickers(self, series_ticker: str, event_ticker: str) -> list[str]:
+        """
+        Return all market tickers in the configured event.
+
+        We rely on `fetch_all=True` so we get the full event market universe.
+        """
         markets_df = self.client.get_markets(
             series_ticker=series_ticker,
             event_ticker=event_ticker,
             fetch_all=True,
         ).to_dataframe()
+
         return markets_df["ticker"].tolist()
 
     def get_market_snapshot(self, market_ticker: str) -> MarketSnapshot:
+        """
+        Fetch the live orderbook for one market and normalize it into our
+        internal MarketSnapshot representation.
+        """
         market = self.client.get_market(market_ticker)
         ob_df = market.get_orderbook().to_dataframe()
 
-        yes_levels = []
-        no_levels = []
+        yes_levels: list[BookLevel] = []
+        no_levels: list[BookLevel] = []
 
-        if "side" in ob_df.columns:
-            yes_df = ob_df[ob_df["side"] == "yes"].copy()
-            no_df = ob_df[ob_df["side"] == "no"].copy()
-            yes_df = yes_df.sort_values("price_dollars", ascending=False)
-            no_df = no_df.sort_values("price_dollars", ascending=False)
+        yes_df = ob_df[ob_df["side"] == "yes"].copy()
+        no_df = ob_df[ob_df["side"] == "no"].copy()
 
-            for _, row in yes_df.iterrows():
-                yes_levels.append(
-                    BookLevel(
-                        price=int(round(float(row["price_dollars"]) * 100)),
-                        quantity=float(row["quantity_fp"]),
-                    )
+        yes_df = yes_df.sort_values("price_dollars", ascending=False)
+        no_df = no_df.sort_values("price_dollars", ascending=False)
+
+        for _, row in yes_df.iterrows():
+            yes_levels.append(
+                BookLevel(
+                    price=self._price_dollars_to_int(row["price_dollars"]),
+                    quantity=float(row["quantity_fp"]),
                 )
-            for _, row in no_df.iterrows():
-                no_levels.append(
-                    BookLevel(
-                        price=int(round(float(row["price_dollars"]) * 100)),
-                        quantity=float(row["quantity_fp"]),
-                    )
-                )
-        else:
-            raise ValueError(
-                "Orderbook DataFrame did not include 'side'. Confirm your installed pykalshi orderbook schema."
             )
 
-        return MarketSnapshot(market_ticker=market_ticker, yes_levels=yes_levels, no_levels=no_levels)
+        for _, row in no_df.iterrows():
+            no_levels.append(
+                BookLevel(
+                    price=self._price_dollars_to_int(row["price_dollars"]),
+                    quantity=float(row["quantity_fp"]),
+                )
+            )
+
+        return MarketSnapshot(
+            market_ticker=market_ticker,
+            yes_levels=yes_levels,
+            no_levels=no_levels,
+        )
 
     def get_market_position(self, market_ticker: str) -> MarketPosition:
-        # You should verify the exact positions dataframe columns in your environment.
+        """
+        Return the current net position for one market.
+
+        Your runtime positions DataFrame has:
+        - ticker
+        - position_fp
+
+        `position_fp` is already netted by Kalshi. So we interpret it as:
+        - > 0 => long YES
+        - < 0 => long NO
+        - = 0 => flat
+
+        We do NOT currently derive avg_entry_price here because the positions
+        DataFrame does not include it. We will source weighted-average entry
+        separately later for daytime flatten logic.
+        """
         positions_df = self.client.portfolio.get_positions().to_dataframe()
         rows = positions_df[positions_df["ticker"] == market_ticker]
+
         if rows.empty:
-            return MarketPosition(market_ticker=market_ticker, side=None, quantity=0.0, avg_entry_price=None)
+            return MarketPosition(
+                market_ticker=market_ticker,
+                side=None,
+                quantity=0.0,
+                avg_entry_price=None,
+            )
 
         row = rows.iloc[0]
-        side_value = str(row.get("side", "")).lower() if row.get("side") is not None else None
-        side = BookSide(side_value) if side_value in {"yes", "no"} else None
-        quantity = float(row.get("count_fp", row.get("quantity_fp", row.get("count", 0.0))))
-        avg_entry_raw = row.get("avg_price", row.get("avg_price_dollars", None))
-        avg_entry_price = None
-        if avg_entry_raw is not None:
-            avg_entry_price = int(round(float(avg_entry_raw) * 100)) if float(avg_entry_raw) <= 1.0 else int(round(float(avg_entry_raw)))
+        position_fp = float(row["position_fp"])
+
+        if position_fp > 0:
+            return MarketPosition(
+                market_ticker=market_ticker,
+                side=BookSide.YES,
+                quantity=position_fp,
+                avg_entry_price=None,
+            )
+
+        if position_fp < 0:
+            return MarketPosition(
+                market_ticker=market_ticker,
+                side=BookSide.NO,
+                quantity=abs(position_fp),
+                avg_entry_price=None,
+            )
 
         return MarketPosition(
             market_ticker=market_ticker,
-            side=side,
-            quantity=quantity,
-            avg_entry_price=avg_entry_price,
+            side=None,
+            quantity=0.0,
+            avg_entry_price=None,
         )
 
     def get_resting_orders(self, market_ticker: str) -> list[RestingOrderState]:
-        # You should verify the exact order dataframe columns in your environment.
-        orders_df = self.client.portfolio.get_orders().to_dataframe()
+        """
+        Return all currently resting orders for one market.
+
+        Your runtime open-orders DataFrame includes:
+        - order_id
+        - ticker
+        - status
+        - side
+        - yes_price_dollars
+        - no_price_dollars
+        - remaining_count_fp
+
+        We normalize each row into our internal RestingOrderState.
+        """
+        orders_df = self.client.portfolio.get_orders(status=OrderStatus.RESTING).to_dataframe()
         rows = orders_df[orders_df["ticker"] == market_ticker]
+
         resting_orders: list[RestingOrderState] = []
+
         for _, row in rows.iterrows():
-            status = str(row.get("status", "")).lower()
-            if status and status != "resting":
-                continue
-            side_value = str(row.get("side", "")).lower()
-            if side_value not in {"yes", "no"}:
-                continue
-            order_id = str(row.get("order_id", row.get("id", "")))
-            price = row.get("yes_price", row.get("price", row.get("price_dollars", None)))
-            if price is None:
-                continue
-            price_int = int(round(float(price) * 100)) if float(price) <= 1.0 else int(round(float(price)))
-            quantity = float(row.get("remaining_count_fp", row.get("count_fp", row.get("remaining_count", 0.0))))
+            side = self._side_to_book_side(row["side"])
+
+            if side == BookSide.YES:
+                price = self._price_dollars_to_int(row["yes_price_dollars"])
+            else:
+                price = self._price_dollars_to_int(row["no_price_dollars"])
+
             resting_orders.append(
                 RestingOrderState(
-                    order_id=order_id,
+                    order_id=str(row["order_id"]),
                     market_ticker=market_ticker,
-                    side=BookSide(side_value),
-                    price=price_int,
-                    quantity=quantity,
+                    side=side,
+                    price=price,
+                    quantity=float(row["remaining_count_fp"]),
                 )
             )
+
         return resting_orders
 
+    # -------------------------------------------------------------------------
+    # Write methods
+    # -------------------------------------------------------------------------
+
     def place_resting_order(self, market_ticker: str, side: BookSide, price: int, quantity: float) -> str:
-        raise NotImplementedError(
-            "Wire this method to client.portfolio.place_order(...) after confirming your installed pykalshi signature."
-        )
+        """
+        Place a new resting BUY order on YES or NO.
+
+        Important:
+        - Strategy prices are stored internally as integer cents.
+        - pykalshi expects dollar-format price fields like "0.45".
+        - We are always placing BUY orders in this strategy.
+        """
+        market = self.client.get_market(market_ticker)
+        price_dollars = f"{price / 100:.2f}"
+        count_fp = str(quantity)
+
+        if side == BookSide.YES:
+            order = self.client.portfolio.place_order(
+                market,
+                Action.BUY,
+                Side.YES,
+                count_fp=count_fp,
+                yes_price_dollars=price_dollars,
+            )
+        else:
+            order = self.client.portfolio.place_order(
+                market,
+                Action.BUY,
+                Side.NO,
+                count_fp=count_fp,
+                no_price_dollars=price_dollars,
+            )
+
+        return str(order.order_id)
 
     def modify_resting_order(self, order_id: str, new_price: int, new_quantity: float) -> None:
-        raise NotImplementedError(
-            "Wire this method to the pykalshi Order.modify(...) path after confirming quantity amendment semantics."
-        )
+        """
+        Amend an existing resting order in place.
+
+        Your runtime Order object exposes `.amend(...)`, not `.modify(...)`.
+        So we use the real runtime method here.
+
+        Note:
+        Depending on Kalshi/pykalshi amendment semantics, certain quantity
+        increases may fail. The engine-level policy should remain:
+        amend first, cancel/replace fallback if needed.
+        """
+        order = self._get_order_object(order_id)
+        price_dollars = f"{new_price / 100:.2f}"
+
+        if str(order.side).lower() == "yes":
+            order.amend(
+                yes_price_dollars=price_dollars,
+                count_fp=str(new_quantity),
+            )
+        else:
+            order.amend(
+                no_price_dollars=price_dollars,
+                count_fp=str(new_quantity),
+            )
 
     def cancel_order(self, order_id: str) -> None:
-        raise NotImplementedError(
-            "Wire this method to order.cancel() or the equivalent order lookup path in your installed pykalshi version."
-        )
+        """
+        Cancel an existing resting order by ID.
+        """
+        order = self._get_order_object(order_id)
+        order.cancel()

@@ -1,0 +1,2 @@
+[console_scripts]
+kalshi-afterhours-bot = kalshi_afterhours_bot.main:main
