@@ -3,17 +3,25 @@ timezone: "America/New_York"
 
 exchange:
   dry_run: true
+  allow_live_orders: false
+  demo: false
+  dotenv_path: "/Users/jackkeim/Library/Mobile Documents/com~apple~CloudDocs/.envs/kalshi.env"
 
 market:
   series_ticker: "KXINXY"
   event_ticker: "KXINXY-26DEC31H1600"
 
+  # Start with a very small whitelist for safety.
+  market_whitelist:
+    - "KXINXY-26DEC31H1600-T4000"
+    - "KXINXY-26DEC31H1600-B8300"
+
 quoting:
-  side_mode: "both"                  # both | yes_only | no_only
-  inventory_mode: "offset_opposite_by_inventory"  # fixed_opposite_size | offset_opposite_by_inventory
+  side_mode: "both"
+  inventory_mode: "offset_opposite_by_inventory"
   target_contracts_per_order: 1000.0
-  default_tick_size: 1                # integer cents for now
-  passive_floor_price: 1              # configurable fallback when filtered side is effectively empty
+  default_tick_size: 1
+  passive_floor_price: 1
 
 thresholds:
   reference_mm_min_size: 100000.0

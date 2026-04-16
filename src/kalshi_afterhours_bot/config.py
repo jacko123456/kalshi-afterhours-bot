@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,11 +12,15 @@ from .models import InventoryMode, SideMode
 
 class ExchangeConfig(BaseModel):
     dry_run: bool = True
+    allow_live_orders: bool = False
+    demo: bool = False
+    dotenv_path: str
 
 
 class MarketConfig(BaseModel):
     series_ticker: str
     event_ticker: str
+    market_whitelist: list[str] = Field(default_factory=list)
 
 
 class QuotingConfig(BaseModel):
@@ -52,7 +57,7 @@ class LoggingConfig(BaseModel):
 class StrategyConfig(BaseModel):
     strategy_name: str = "kalshi-afterhours-shadow"
     timezone: str = "America/New_York"
-    exchange: ExchangeConfig = Field(default_factory=ExchangeConfig)
+    exchange: ExchangeConfig
     market: MarketConfig
     quoting: QuotingConfig = Field(default_factory=QuotingConfig)
     thresholds: ThresholdConfig = Field(default_factory=ThresholdConfig)
