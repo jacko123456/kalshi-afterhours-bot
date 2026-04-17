@@ -1,0 +1,43 @@
+strategy_name: "spx-afterhours-shadow-test"
+timezone: "America/New_York"
+
+exchange:
+  dry_run: true
+  allow_live_orders: false
+  demo: false
+  dotenv_path: "/Users/jackkeim/Library/Mobile Documents/com~apple~CloudDocs/.envs/kalshi.env"
+
+market:
+  series_ticker: "KXINXY"
+  event_ticker: "KXINXY-26DEC31H1600"
+
+  market_whitelist:
+    - "KXINXY-26DEC31H1600-T4000"
+    - "KXINXY-26DEC31H1600-B8300"
+    - "KXINXY-26DEC31H1600-B7700"
+
+quoting:
+  side_mode: "both"
+  inventory_mode: "offset_opposite_by_inventory"
+  target_contracts_per_order: 1000.0
+  default_tick_size: 1
+  passive_floor_price: 1
+
+thresholds:
+  reference_mm_min_size: 100000.0
+  quote_follow_min_size: 250.0
+  flatten_follow_min_size: 250.0
+
+schedule:
+  capture_reference_time: "15:55"
+  begin_repricing_time: "16:05"
+  end_overnight_time: "09:25"
+  reprice_every_minutes: 5
+
+storage:
+  snapshot_json_path: "data/reference_snapshot_test.json"
+  sqlite_path: "data/strategy_state_test.sqlite"
+  log_path: "logs/strategy_test.log"
+
+logging:
+  level: "INFO"
