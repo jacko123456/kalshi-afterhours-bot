@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from .models import MarketReferenceSnapshot, ReferenceQuote
@@ -16,7 +16,8 @@ class StateStore:
     Current responsibilities:
     - save frozen reference snapshots to JSON
     - load frozen reference snapshots from JSON
-    - optionally store simple cycle / exception logs in SQLite
+    - expose the saved snapshot trading date for safety validation
+    - store lightweight cycle / exception logs in SQLite
 
     Why this design:
     - the 3:55 PM reference snapshot must survive process restarts
@@ -122,6 +123,20 @@ class StateStore:
             snapshots[snapshot.market_ticker] = snapshot
 
         return snapshots
+
+    def get_reference_snapshot_trading_date(self) -> date:
+        """
+        Return the trading date of the saved reference snapshot.
+
+        We inspect the first snapshot entry and use its timestamp date.
+        Assumes all entries in one saved snapshot were captured together.
+        """
+        snapshots = self.load_reference_snapshot()
+        if not snapshots:
+            raise ValueError("Saved reference snapshot is empty.")
+
+        first_snapshot = next(iter(snapshots.values()))
+        return first_snapshot.timestamp.date()
 
     # -------------------------------------------------------------------------
     # Lightweight cycle / exception logging

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from pykalshi import KalshiClient
@@ -40,6 +42,32 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def summarize_actions(result) -> tuple[int, int, dict[str, int]]:
+    """
+    Return:
+    - eligible market count
+    - skipped market count
+    - action_type -> count
+
+    This makes each cycle much easier to read quickly.
+    """
+    eligible_markets = 0
+    skipped_markets = 0
+    action_counts = {"KEEP": 0, "AMEND": 0, "CANCEL": 0, "PLACE": 0}
+
+    for market_result in result.market_results:
+        if market_result.eligible:
+            eligible_markets += 1
+        else:
+            skipped_markets += 1
+
+        for action in market_result.planned_actions:
+            if action.action_type in action_counts:
+                action_counts[action.action_type] += 1
+
+    return eligible_markets, skipped_markets, action_counts
+
+
 def main() -> None:
     args = build_parser().parse_args()
     config = load_config(args.config)
@@ -50,6 +78,8 @@ def main() -> None:
         log_path=config.storage.log_path,
     )
 
+    # Safety guard:
+    # --live is ignored unless config.exchange.allow_live_orders is also true.
     if args.live and not config.exchange.allow_live_orders:
         raise RuntimeError(
             "Refusing live execution because exchange.allow_live_orders is false in config."
@@ -106,6 +136,16 @@ def main() -> None:
         return
 
     if args.command == "run-overnight":
+        # Refuse to run if the saved snapshot is not from today's NY trading date.
+        snapshot_date = state_store.get_reference_snapshot_trading_date()
+        today_ny = datetime.now(ZoneInfo(config.timezone)).date()
+
+        if snapshot_date != today_ny:
+            raise RuntimeError(
+                f"Refusing to run overnight cycle because saved reference snapshot date "
+                f"{snapshot_date} does not match today's NY date {today_ny}."
+            )
+
         result = run_single_overnight_cycle_from_saved_snapshot(
             adapter=adapter,
             config=cycle_config,
@@ -113,12 +153,23 @@ def main() -> None:
             dry_run=dry_run,
         )
 
+        eligible_markets, skipped_markets, action_counts = summarize_actions(result)
+
         logger.info("Cycle complete")
         logger.info("Timestamp: %s", result.timestamp)
         logger.info("Event ticker: %s", result.event_ticker)
         logger.info("Markets processed: %d", len(result.market_results))
         logger.info("Total planned actions: %d", result.total_actions)
         logger.info("Dry run: %s", dry_run)
+        logger.info("Eligible markets: %d", eligible_markets)
+        logger.info("Skipped markets: %d", skipped_markets)
+        logger.info(
+            "Action summary: KEEP=%d AMEND=%d CANCEL=%d PLACE=%d",
+            action_counts["KEEP"],
+            action_counts["AMEND"],
+            action_counts["CANCEL"],
+            action_counts["PLACE"],
+        )
 
         for market_result in result.market_results:
             logger.info(
